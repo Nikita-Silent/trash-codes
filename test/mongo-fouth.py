@@ -1,5 +1,17 @@
-from pymongo import MongoClient
-from pprint import pprint
+import psycopg2
+from pymongo import MongoClient, UpdateMany
+from datetime import datetime
+import json
+from bson import json_util
+
+# Конфигурация подключения к PostgreSQL
+POSTGRES_CONFIG = {
+    "host": "192.168.50.24",
+    "database": "demo",
+    "user": "postgres",
+    "password": "postgres",
+    "port": "5432"
+}
 
 # Конфигурация подключения к MongoDB
 MONGO_CONFIG = {
@@ -11,73 +23,92 @@ MONGO_CONFIG = {
     "authMechanism": "SCRAM-SHA-256"    # Механизм аутентификации
 }
 
-def main():
-    # Подключение к MongoDB
-    client = MongoClient(**MONGO_CONFIG)
-    db = client.airline_database
-    bookings = db.bookings
-
+def convert_dates_in_collection():
+    """Обновление документов: преобразование строк в даты"""
     try:
-        # Пайплайн агрегации
+        client = MongoClient(**MONGO_CONFIG)
+        db = client.airline_database
+        bookings = db.bookings
+        
+        # Находим документы с датами в виде строк
+        docs_with_string_dates = bookings.find({
+            "booking_date": {"$type": "string"}
+        })
+
+        bulk_operations = []
+        for doc in docs_with_string_dates:
+            try:
+                new_date = datetime.fromisoformat(doc['booking_date'])
+                bulk_operations.append(
+                    UpdateMany(
+                        {"_id": doc['_id']},
+                        {"$set": {"booking_date": new_date}}
+                    )
+                )
+            except Exception as e:
+                print(f"Ошибка в документе {doc['_id']}: {str(e)}")
+
+        if bulk_operations:
+            bookings.bulk_write(bulk_operations)
+            print(f"Обновлено {len(bulk_operations)} документов")
+
+        client.close()
+    except Exception as e:
+        print(f"Ошибка подключения: {str(e)}")
+
+def run_aggregation():
+    """Выполнение агрегации с преобразованием дат"""
+    try:
+        client = MongoClient(**MONGO_CONFIG)
+        db = client.airline_database
+        
         pipeline = [
             {
-                "$project": {
-                    "_id": 0,
-                    "booking_ref": 1,
-                    "booking_year": {"$year": "$booking_date"},
-                    "total_tickets": {"$size": "$tickets"},
-                    "average_price": {
-                        "$divide": ["$total_amount", {"$size": "$tickets"}]
-                    },
-                    "departure_airports": {
-                        "$setUnion": ["$tickets.flights.departure_airport"]
-                    },
-                    "has_international": {
-                        "$anyElementTrue": {
-                            "$map": {
-                                "input": "$tickets.flights",
-                                "as": "flight",
-                                "in": {"$ne": ["$$flight.status", "Scheduled"]}
-                            }
+                "$addFields": {
+                    "booking_date": {
+                        "$cond": {
+                            "if": {"$eq": [{"$type": "$booking_date"}, "string"]},
+                            "then": {"$dateFromString": {"dateString": "$booking_date"}},
+                            "else": "$booking_date"
                         }
                     }
                 }
             },
             {
-                "$match": {
-                    "total_tickets": {"$gt": 1},
-                    "has_international": True
+                "$project": {
+                    "year": {"$year": "$booking_date"},
+                    "month": {"$month": "$booking_date"},
+                    "total_tickets": {"$size": "$tickets"},
+                    "avg_price": {
+                        "$divide": [
+                            "$total_amount",
+                            {"$cond": [
+                                {"$eq": [{"$size": "$tickets"}, 0]},
+                                1,
+                                {"$size": "$tickets"}
+                            ]}
+                        ]
+                    }
                 }
             },
-            {
-                "$sort": {"average_price": -1}
-            }
+            {"$match": {"total_tickets": {"$gt": 1}}},
+            {"$sort": {"year": 1, "month": 1}},
+            {"$limit": 10}
         ]
 
-        # Выполнение агрегации
-        results = bookings.aggregate(pipeline)
-
-        # Вывод результатов
-        print("{:<12} {:<6} {:<8} {:<12} {:<25} {}".format(
-            "Booking Ref", "Year", "Tickets", "Avg Price", 
-            "Departure Airports", "International"
-        ))
-        print("-" * 85)
+        results = db.bookings.aggregate(pipeline)
         
+        print("\nРезультаты агрегации:")
+        print("{:<6} {:<6} {:<8} {:<12}".format(
+            "Год", "Месяц", "Билеты", "Ср.Цена"
+        ))
         for doc in results:
-            print("{:<12} {:<6} {:<8} {:<12.2f} {:<25} {}".format(
-                doc['booking_ref'],
-                doc['booking_year'],
-                doc['total_tickets'],
-                doc['average_price'],
-                ", ".join(sorted(doc['departure_airports'])),
-                "✓" if doc['has_international'] else "✗"
-            ))
+            print(f"{doc['year']:<6} {doc['month']:<6} {doc['total_tickets']:<8} {doc['avg_price']:<12.2f}")
 
-    except Exception as e:
-        print(f"Ошибка при выполнении агрегации: {str(e)}")
-    finally:
         client.close()
+    except Exception as e:
+        print(f"Ошибка агрегации: {str(e)}")
 
 if __name__ == "__main__":
-    main()
+    convert_dates_in_collection()
+    run_aggregation()
